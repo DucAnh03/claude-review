@@ -9,3 +9,9 @@ Bước 3: Slack Bot - Nhận message từ channel - Parse format: review [repo]
 Bước 4: Job Queue - Xử lý concurrent requests
 
 pip install slack-bolt python-dotenv
+
+cd "D:\aaaaaaaaaaaaaaaaaaaaaaaaa\claude_flow_review\review-ui"
+npm run dev
+
+cd "D:\aaaaaaaaaaaaaaaaaaaaaaaaa\claude_flow_review"
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload

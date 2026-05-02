@@ -145,6 +145,7 @@ class JobManager:
             dev_name=params["dev_name"],
         )
         return {
+            "review_id":   result.get("review_id"),
             "verdict":     result["verdict"],
             "report_path": str(result["report_path"]),
             "pr_info":     result["pr_info"],

@@ -43,10 +43,13 @@ class SkillsBody(BaseModel):
     skills: list[str]
 
 
-def _row_to_dict(row) -> dict:
+def _row_to_dict(row, mask_token: bool = True) -> dict:
     if row is None:
         return None
-    return {k: row[k] for k in row.keys()}
+    d = {k: row[k] for k in row.keys()}
+    if mask_token and d.get("github_token"):
+        d["github_token"] = "***"
+    return d
 
 
 # --- Endpoints ---------------------------------------------------------

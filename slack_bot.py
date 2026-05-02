@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Slack Bot - Code Review System
-Socket Mode: không cần public URL hay ngrok.
+Slack Review Bot — nhận lệnh review commit / PR từ developer.
 
-Setup .env:
+.env:
   SLACK_BOT_TOKEN=xoxb-...
   SLACK_APP_TOKEN=xapp-...
   SLACK_SIGNING_SECRET=...
 
-Usage dev trong channel #code-review:
-  review [repo-name] [commit-hash] [dev-name] | mô tả task
-  review tool_monitor b58927b duc | Thêm feature đọc CSV
+Commands:
+  review [repo] [commit] [slack_id] | task description
+  review-pr [repo] [pr_number] [slack_id]
 """
 
 import os
@@ -23,7 +22,6 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# Import các module đã build
 import db as database
 import pr_review as pr_module
 from review_core import (
@@ -36,31 +34,23 @@ from review_core import (
 
 load_dotenv()
 
-# --- Config -----------------------------------------------------------
 SLACK_BOT_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN      = os.environ["SLACK_APP_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-REVIEW_CHANNEL       = os.getenv("REVIEW_CHANNEL", "code-review")
 
-VERDICT_ICON = {
-    "OK":      "✅",
-    "WARNING": "⚠️",
-    "SERIOUS": "🚨",
-}
+VERDICT_ICON = {"OK": "✅", "WARNING": "⚠️", "SERIOUS": "🚨"}
 
-# Job queue — xử lý tuần tự, tránh conflict git checkout
 job_queue: Queue = Queue()
-
-# --- Slack App --------------------------------------------------------
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 
+
+# ── Parsers ──────────────────────────────────────────────────────────────────
 
 def _clean(text: str) -> str:
     return re.sub(r"<@\w+>\s*", "", text).strip()
 
 
-def parse_message(text: str) -> dict | None:
-    """review [repo] [commit] [dev] | task"""
+def parse_commit(text: str) -> dict | None:
     text = _clean(text)
     m = re.match(r"^review\s+(\S+)\s+(\S+)\s+(\S+)\s*\|\s*(.+)$", text, re.IGNORECASE)
     if not m:
@@ -69,8 +59,7 @@ def parse_message(text: str) -> dict | None:
             "dev": m.group(3), "task": m.group(4).strip()}
 
 
-def parse_pr_message(text: str) -> dict | None:
-    """review-pr [repo] [pr_number] [dev]"""
+def parse_pr(text: str) -> dict | None:
     text = _clean(text)
     m = re.match(r"^review-pr\s+(\S+)\s+(\d+)\s+(\S+)$", text, re.IGNORECASE)
     if not m:
@@ -79,221 +68,141 @@ def parse_pr_message(text: str) -> dict | None:
             "pr_number": int(m.group(2)), "dev": m.group(3)}
 
 
-def post_message(client, channel: str, text: str, thread_ts: str | None = None):
-    client.chat_postMessage(
-        channel=channel,
-        text=text,
-        thread_ts=thread_ts,
-    )
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def post(client, channel: str, text: str, thread_ts: str | None = None):
+    client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
 
 
 def upload_report(client, channel: str, report_path: Path, verdict: str, thread_ts: str | None = None):
-    icon  = VERDICT_ICON.get(verdict, "❓")
-    title = f"{icon} Review Report — {report_path.name}"
+    icon = VERDICT_ICON.get(verdict, "❓")
     client.files_upload_v2(
         channel=channel,
         file=str(report_path),
         filename=report_path.name,
-        title=title,
-        initial_comment=f"{icon} *[{verdict}]* Review hoàn tất! Xem file đính kèm để biết chi tiết.",
+        title=f"{icon} Review Report — {report_path.name}",
+        initial_comment=f"{icon} *[{verdict}]* Review complete!",
         thread_ts=thread_ts,
     )
 
 
-def _validate_repo_dev(client, channel: str, thread_ts: str,
-                        repo: str, slack_id: str) -> bool:
-    repo_row = database.get_repo(repo)
-    print(f"[validate] repo='{repo}' found={repo_row is not None}")
-    if not repo_row:
-        post_message(client, channel,
-            f"❌ Repo `{repo}` không tồn tại trong DB.\n"
-            f"Vào Admin UI để thêm repo trước.", thread_ts)
-        return False
+def resolve_dev(repo: str, slack_id: str) -> str | None:
+    """Return dev_name for slack_id, or slack_id if no devs configured. None if invalid."""
     devs = database.get_devs(repo)
-    print(f"[validate] slack_id='{slack_id}' devs_in_db={[d['slack_id'] for d in devs]}")
-    if devs and not any(d["slack_id"] == slack_id for d in devs):
-        slack_ids = [d["slack_id"] for d in devs if d["slack_id"]]
-        post_message(client, channel,
-            f"❌ Slack ID `{slack_id}` không có trong repo `{repo}`.\n"
-            f"Danh sách Slack ID: {', '.join(f'`{s}`' for s in slack_ids)}", thread_ts)
-        return False
-    return True
+    if not devs:
+        return slack_id
+    row = next((d for d in devs if d["slack_id"] == slack_id), None)
+    return row["dev_name"] if row else None
 
 
-def run_review_job(client, channel: str, thread_ts: str, parsed: dict):
-    repo     = parsed["repo"]
-    commit   = parsed["commit"]
-    slack_id = parsed["dev"]
-    dev_name = parsed.get("dev_name", slack_id)
-    task     = parsed["task"]
+# ── Job runners ───────────────────────────────────────────────────────────────
 
-    if not _validate_repo_dev(client, channel, thread_ts, repo, slack_id):
-        return
-
+def run_commit_job(client, channel: str, thread_ts: str, job: dict):
+    repo     = job["repo"]
+    commit   = job["commit"]
+    dev_name = job["dev_name"]
+    task     = job["task"]
     try:
         repo_dir = Path(database.get_repo_dir(repo))
-
-        post_message(client, channel, f"🔄 Đang fetch & checkout `{commit}` cho repo `{repo}`...", thread_ts)
+        post(client, channel, f"🔄 Fetching `{commit}`...", thread_ts)
         git_fetch_checkout(repo_dir, commit)
-
-        post_message(client, channel, "🤖 Claude đang review code... (~1-3 phút)", thread_ts)
-        claude_output = run_claude_review(repo_dir, task, repo_name=repo)
-
-        verdict = extract_verdict(claude_output)
-
-        md_content  = build_markdown(repo, commit, task, dev_name, claude_output, verdict)
-        report_path = save_report(repo, commit, md_content)
-
-        database.add_review(
-            repo_name=repo,
-            commit_hash=commit,
-            verdict=verdict,
-            report_path=str(report_path),
-            task_desc=task,
-            dev_name=dev_name,
-        )
-
-        upload_report(client, channel, report_path, verdict, thread_ts)
-
-    except SystemExit as e:
-        post_message(client, channel, f"❌ Lỗi: {e}", thread_ts)
+        post(client, channel, "🤖 Claude reviewing... (~1-3 min)", thread_ts)
+        output  = run_claude_review(repo_dir, task, repo_name=repo)
+        verdict = extract_verdict(output)
+        md      = build_markdown(repo, commit, task, dev_name, output, verdict)
+        path    = save_report(repo, commit, md)
+        database.add_review(repo_name=repo, commit_hash=commit, verdict=verdict,
+                            report_path=str(path), task_desc=task, dev_name=dev_name)
+        upload_report(client, channel, path, verdict, thread_ts)
     except Exception as e:
-        post_message(client, channel, f"❌ Unexpected error: {e}", thread_ts)
+        post(client, channel, f"❌ Error: {e}", thread_ts)
 
 
-def run_pr_review_job(client, channel: str, thread_ts: str, parsed: dict):
-    repo      = parsed["repo"]
-    pr_number = parsed["pr_number"]
-    slack_id  = parsed["dev"]
-    dev_name  = parsed.get("dev_name", slack_id)
-
-    if not _validate_repo_dev(client, channel, thread_ts, repo, slack_id):
-        return
-
+def run_pr_job(client, channel: str, thread_ts: str, job: dict):
+    repo      = job["repo"]
+    pr_number = job["pr_number"]
+    dev_name  = job["dev_name"]
     try:
-        post_message(client, channel, f"🔍 Đang fetch PR #{pr_number} từ GitHub...", thread_ts)
-        result = pr_module.review_pr(repo, pr_number, dev_name)
-
-        pr_info = result["pr_info"]
+        post(client, channel, f"🔍 Fetching PR #{pr_number}...", thread_ts)
+        result  = pr_module.review_pr(repo, pr_number, dev_name)
+        info    = result["pr_info"]
         verdict = result["verdict"]
         icon    = VERDICT_ICON.get(verdict, "❓")
-
         upload_report(client, channel, result["report_path"], verdict, thread_ts)
-        post_message(
-            client, channel,
-            f"{icon} *PR #{pr_number} — {pr_info['title']}*\n"
-            f"• Author: `{pr_info['author']}` | `{pr_info['base_branch']}` ← `{pr_info['head_branch']}`\n"
-            f"• Verdict: *{verdict}*",
-            thread_ts,
-        )
-    except (ValueError, RuntimeError) as e:
-        post_message(client, channel, f"❌ Lỗi: {e}", thread_ts)
+        post(client, channel,
+             f"{icon} *PR #{pr_number} — {info['title']}*\n"
+             f"• Author: `{info['author']}` | `{info['base_branch']}` ← `{info['head_branch']}`\n"
+             f"• Verdict: *{verdict}*", thread_ts)
     except Exception as e:
-        post_message(client, channel, f"❌ Unexpected error: {e}", thread_ts)
+        post(client, channel, f"❌ Error: {e}", thread_ts)
 
 
-# --- Worker thread ----------------------------------------------------
+# ── Worker ────────────────────────────────────────────────────────────────────
 
 def worker(client):
     while True:
         job = job_queue.get()
-        if job is None:
-            break
         try:
-            parsed = job["parsed"]
-            if parsed["type"] == "pr":
-                run_pr_review_job(client, job["channel"], job["thread_ts"], parsed)
-            else:
-                run_review_job(client, job["channel"], job["thread_ts"], parsed)
+            if job["type"] == "commit":
+                run_commit_job(client, job["channel"], job["thread_ts"], job)
+            elif job["type"] == "pr":
+                run_pr_job(client, job["channel"], job["thread_ts"], job)
         finally:
             job_queue.task_done()
 
 
-# --- Event handler ----------------------------------------------------
+# ── Event handler ─────────────────────────────────────────────────────────────
 
 @app.event("message")
 def handle_message(event, say):
-    # Bỏ qua bot message và edited message
     if event.get("bot_id") or event.get("subtype"):
         return
 
-    text       = event.get("text", "")
-    channel    = event.get("channel")
-    thread_ts  = event.get("thread_ts") or event.get("ts")
+    text      = event.get("text", "")
+    channel   = event.get("channel")
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    slack_id  = event.get("user", "")
 
-    parsed = parse_message(text) or parse_pr_message(text)
+    parsed = parse_commit(text) or parse_pr(text)
     if not parsed:
         return
 
-    repo     = parsed["repo"]
-    slack_id = parsed["dev"]
-
-    # Validate repo exists
-    repo_row = database.get_repo(repo)
-    if not repo_row:
-        say(text=f"❌ Repo `{repo}` không tồn tại trong DB. Vào Admin UI để thêm.",
+    repo = parsed["repo"]
+    if not database.get_repo(repo):
+        say(text=f"❌ Repo `{repo}` not found. Clone it first with the smart bot.",
             thread_ts=thread_ts)
         return
 
-    # Validate slack_id and resolve dev_name
-    devs = database.get_devs(repo)
-    dev_row = next((d for d in devs if d["slack_id"] == slack_id), None)
-    if devs and dev_row is None:
-        slack_ids = [d["slack_id"] for d in devs if d["slack_id"]]
-        say(text=(f"❌ Slack ID `{slack_id}` không có trong repo `{repo}`.\n"
-                  f"Danh sách Slack ID: {', '.join(f'`{s}`' for s in slack_ids)}"),
+    dev_name = resolve_dev(repo, slack_id)
+    if dev_name is None:
+        devs = database.get_devs(repo)
+        valid = [d["slack_id"] for d in devs if d["slack_id"]]
+        say(text=f"❌ Slack ID `{slack_id}` not in repo `{repo}`.\nValid: {', '.join(f'`{s}`' for s in valid)}",
             thread_ts=thread_ts)
         return
-
-    dev_name = dev_row["dev_name"] if dev_row else slack_id
-    parsed = {**parsed, "dev_name": dev_name}
 
     if parsed["type"] == "commit":
-        say(
-            text=(
-                f"📋 *Review request nhận được!*\n"
-                f"• Repo: `{repo}`\n"
-                f"• Commit: `{parsed['commit']}`\n"
-                f"• Dev: *{dev_name}*\n"
-                f"• Task: _{parsed['task']}_\n"
-                f"⏳ Đang xếp vào queue..."
-            ),
-            thread_ts=thread_ts,
-        )
+        say(text=(f"📋 *Review queued*\n• Repo: `{repo}` • Commit: `{parsed['commit']}`\n"
+                  f"• Dev: *{dev_name}* • Task: _{parsed['task']}_\n⏳"),
+            thread_ts=thread_ts)
+        job_queue.put({"type": "commit", "channel": channel, "thread_ts": thread_ts,
+                       "repo": repo, "commit": parsed["commit"],
+                       "task": parsed["task"], "dev_name": dev_name})
     else:
-        say(
-            text=(
-                f"🔎 *PR Review request nhận được!*\n"
-                f"• Repo: `{repo}`\n"
-                f"• PR: `#{parsed['pr_number']}`\n"
-                f"• Dev: *{dev_name}*\n"
-                f"⏳ Đang xếp vào queue..."
-            ),
-            thread_ts=thread_ts,
-        )
-
-    job_queue.put({
-        "channel":   channel,
-        "thread_ts": thread_ts,
-        "parsed":    parsed,
-    })
+        say(text=(f"🔎 *PR review queued*\n• Repo: `{repo}` • PR: `#{parsed['pr_number']}`\n"
+                  f"• Dev: *{dev_name}*\n⏳"),
+            thread_ts=thread_ts)
+        job_queue.put({"type": "pr", "channel": channel, "thread_ts": thread_ts,
+                       "repo": repo, "pr_number": parsed["pr_number"], "dev_name": dev_name})
 
 
-# --- Main -------------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     database.init_db()
-
-    # Khởi động worker thread
-    t = threading.Thread(target=worker, args=(app.client,), daemon=True)
-    t.start()
-
-    print("[bot] Starting Slack bot (Socket Mode)...")
-    print(f"[bot] Listening in #{REVIEW_CHANNEL}")
-    print("[bot] Format: review [repo] [commit] [dev] | mô tả task")
-
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    handler.start()
+    threading.Thread(target=worker, args=(app.client,), daemon=True).start()
+    print("[review-bot] Started. Commands: review / review-pr")
+    SocketModeHandler(app, SLACK_APP_TOKEN).start()
 
 
 if __name__ == "__main__":

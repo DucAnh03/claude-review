@@ -42,11 +42,14 @@ def _build_skill_section(repo_name: str) -> str:
         return "Detect the main language(s) from the diff and apply relevant best practices."
     read_lines = []
     for skill in skills:
-        filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
+        if skill.lower().endswith(".md"):
+            filename = skill.lower()
+        else:
+            filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
         p = SKILLS_DIR / filename
         if p.exists():
             read_lines.append(f'- Read "{p}"')
-    skill_list = ", ".join(skills)
+    skill_list = ", ".join(s.replace(".md", "") for s in skills)
     if read_lines:
         return f"This repo uses: {skill_list}. Read the skill guideline files:\n" + "\n".join(read_lines)
     return f"This repo uses: {skill_list}. Apply relevant best practices for these technologies."

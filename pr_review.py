@@ -33,11 +33,14 @@ def _build_skill_section(repo_name: str) -> str:
         return "Detect the main language(s) from the diff and apply relevant best practices."
     read_lines = []
     for skill in skills:
-        filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
+        if skill.lower().endswith(".md"):
+            filename = skill.lower()
+        else:
+            filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
         p = SKILLS_DIR / filename
         if p.exists():
             read_lines.append(f'- Read "{p}"')
-    skill_list = ", ".join(skills)
+    skill_list = ", ".join(s.replace(".md", "") for s in skills)
     if read_lines:
         return f"This repo uses: {skill_list}. Read the skill guideline files:\n" + "\n".join(read_lines)
     return f"This repo uses: {skill_list}. Apply relevant best practices for these technologies."
@@ -216,7 +219,10 @@ def _log_review_plan(repo_name: str) -> None:
     skills = _db.get_repo_skills(repo_name) if repo_name else []
     if skills:
         for skill in skills:
-            filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
+            if skill.lower().endswith(".md"):
+                filename = skill.lower()
+            else:
+                filename = skill.lower().replace("/", "").replace(" ", "_") + ".md"
             p = SKILLS_DIR / filename
             mark = "[OK]" if p.exists() else "[NOT FOUND]"
             print(f"[review] Skill     : {skill} -> {p.name} {mark}")
@@ -341,7 +347,7 @@ def review_pr(repo_name: str, pr_number: int, dev_name: str, token_override: str
     md_content  = build_pr_markdown(pr_info, dev_name, claude_output, verdict)
     report_path = save_pr_report(repo_name, pr_number, md_content)
 
-    _db.add_review(
+    review_id = _db.add_review(
         repo_name   = repo_name,
         commit_hash = pr_info["head_sha"],
         verdict     = verdict,
@@ -351,6 +357,7 @@ def review_pr(repo_name: str, pr_number: int, dev_name: str, token_override: str
     )
 
     return {
+        "review_id":   review_id,
         "pr_info":     pr_info,
         "verdict":     verdict,
         "report_path": report_path,
